@@ -1,3 +1,7 @@
+"""
+YOLO 模型推理服务
+"""
+
 import os
 import json
 import base64
@@ -144,6 +148,42 @@ def smooth_polygon(points, method='chaikin', iterations=2):
         return smooth_polygon_chaikin(points, iterations=iterations)
 
 
+def reorder_polygon_by_angle(points):
+    """
+    将多边形顶点按质心极角排序，修复 YOLO 输出乱序导致的自相交/乱穿线问题。
+
+    Args:
+        points: 原始多边形顶点列表 [[x, y], ...]
+
+    Returns:
+        按极角排序后的顶点列表
+    """
+    pts = np.array(points, dtype=np.float64)
+    if len(pts) < 3:
+        return points
+    cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
+    angles = np.arctan2(pts[:, 1] - cy, pts[:, 0] - cx)
+    order = np.argsort(angles)
+    return [(float(pts[i, 0]), float(pts[i, 1])) for i in order]
+
+
+def simplify_polygon(points, tolerance=2.0):
+    """
+    使用 Douglas-Peucker 算法简化多边形，在保留形状的同时大幅减少点数。
+
+    Args:
+        points: 原始多边形顶点列表 [[x, y], ...]
+        tolerance: 简化容差（像素），值越大点越少
+
+    Returns:
+        简化后的顶点列表
+    """
+    import cv2
+    pts = np.array(points, dtype=np.float32)
+    simplified = cv2.approxPolyDP(pts, tolerance, closed=True)
+    return [(float(p[0][0]), float(p[0][1])) for p in simplified]
+
+
 def convert_to_labelme_format(image_path, image_size, masks_list, labels_list, names,
                               smooth=True, smooth_method='chaikin', smooth_iterations=2):
     """
@@ -178,7 +218,10 @@ def convert_to_labelme_format(image_path, image_size, masks_list, labels_list, n
             label_name = names[int(cls)]
             points = [(float(point[0]), float(point[1])) for point in polygon]
 
-            if smooth and label_name != 'out':
+            points = reorder_polygon_by_angle(points)
+            points = simplify_polygon(points, tolerance=2.0)
+
+            if smooth:
                 points = smooth_polygon(points, method=smooth_method, iterations=smooth_iterations)
             shape = {
                 "label": label_name,

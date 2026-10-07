@@ -1,3 +1,8 @@
+"""
+Excel下载服务
+"""
+
+
 import os
 import json
 import pandas as pd
@@ -47,9 +52,26 @@ class ExcelDownloadService:
         self._sync_engine = create_engine(sync_db_url, echo=False)
 
     def get_available_columns(self) -> Dict[str, str]:
+        """返回当前服务支持的所有可导出列名及其中文显示名映射。"""
         return self.available_columns
 
     def _compute_from_paths(self, original_file_path: str, json_file_path: str, unit: str, scale: float) -> Dict[str, Any]:
+        """
+        根据原始图像文件路径和标注结果 JSON 文件路径，计算一组完整的水稻茎秆分析指标。
+
+        主要处理流程：
+        1. 从 JSON 中读取标注数据（大/小维管束、茎秆外轮廓、空腔轮廓）。
+        2. 通过 `_label_binarize` 或多边形面积公式计算茎秆面积、周长、空腔面积。
+        3. 读取原图并调用 `_get_scaler` 自动检测标尺像素长度，推导像素到实际单位的缩放比例。
+        4. 结合 `unit_conversion` 将像素面积/长度转换为用户指定单位（um/mm/cm）。
+        5. 计算各类派生指标（总数、比值、差值等）并汇总返回。
+
+        :param original_file_path: 原始图像的绝对路径，用于检测标尺像素长度。
+        :param json_file_path: LabelMe 风格的标注结果 JSON 路径，包含 shapes 字段。
+        :param unit: 目标单位字符串，支持 "um"、"μm"、"mm"、"cm"。
+        :param scale: 用户指定的标尺实际长度（微米），默认 500。
+        :return: 包含所有分析指标的字典，键名为英文字段名（与 available_columns 对应）。
+        """
         with open(json_file_path, 'r', encoding='utf-8') as f:
             analysis_data = json.load(f)
 
@@ -166,7 +188,17 @@ class ExcelDownloadService:
 
     def load_analysis_data_from_record(self, record: Analysis, unit: str = "um", scale: float = 500.0) -> Dict[str, Any]:
         """
-        【优化版本】直接使用已查出的 Analysis 记录，跳过二次查库和 os.walk 遍历。
+        直接基于已从数据库查出的 Analysis 记录计算分析指标。
+
+        该方法跳过二次查库和 os.walk 遍历，直接从 record 中取出
+        original_file_path 与 result_json_path 后委托给 _compute_from_paths，
+        适用于上层已完成持久化查询的场景，减少 I/O 开销。
+
+        :param record: 已查询到的 Analysis ORM 实体，需包含原始文件和 JSON 文件路径。
+        :param unit: 目标单位，默认 "um"。
+        :param scale: 标尺实际长度（微米），默认 500。
+        :return: 完整的分析指标字典。
+        :raises HTTPException 404: 当原始文件或 JSON 文件路径无效或文件不存在时。
         """
         original_file_path = record.original_file_path
         json_file_path = record.result_json_path
@@ -180,7 +212,16 @@ class ExcelDownloadService:
 
     def load_analysis_data(self, analysis_id: str, user_id: str, unit: str = "um", scale: float = 500.0) -> Dict[str, Any]:
         """
-        兼容旧接口：查库 + os.walk 兜底（用于单个导出端点）。
+        兼容旧接口：根据 analysis_id + user_id 查库，并在 JSON 路径缺失时通过
+        os.walk 用户数据目录回退查找标注文件，最终调用 _compute_from_paths 计算指标。
+
+        :param analysis_id: 分析记录在数据库中的唯一标识。
+        :param user_id: 当前用户 ID，用于回退时限定搜索目录范围。
+        :param unit: 目标单位，默认 "um"。
+        :param scale: 标尺实际长度（微米），默认 500。
+        :return: 完整的分析指标字典。
+        :raises HTTPException 404: 当记录不存在、原始文件或 JSON 文件缺失时。
+        :raises HTTPException 500: 其它未知异常。
         """
         try:
             from sqlmodel import select as _select
@@ -226,6 +267,17 @@ class ExcelDownloadService:
             raise HTTPException(status_code=500, detail=f"加载分析数据失败: {str(e)}")
 
     def _get_scaler(self, img_arr: np.ndarray, img_height: int, img_width: int) -> float:
+        """
+        通过检测图像右下角区域的红蓝色像素条，自动估算标尺在像素下的长度。
+
+        原理：标尺通常由红色长条和蓝色长条组成，分别在 HSV/RGB 空间中筛选红色与蓝色，
+        统计两者的像素和的最大值作为标尺像素长度；若检测失败则回退为 500.0。
+
+        :param img_arr: 原图的 numpy 数组（H x W x 3，RGB 顺序）。
+        :param img_height: 图像高度。
+        :param img_width: 图像宽度。
+        :return: 检测到的标尺像素长度，失败时返回 500.0。
+        """
         try:
             rd = img_arr[img_height // 2:, img_width // 2:, :]
             red_mask = (rd[..., 0] >= 240) & (rd[..., 1] <= 20) & (rd[..., 2] <= 20)
@@ -239,6 +291,20 @@ class ExcelDownloadService:
             return 500.0
 
     def _label_binarize(self, img_h: int, img_w: int, points: List[List[float]]) -> tuple:
+        """
+        将标注点多边形填充为二值图像，并进行形态学闭运算平滑边界，
+        最终返回该多边形在像素空间中的面积和周长。
+
+        流程：
+        1. 创建全黑二值图，用 cv2.fillPoly 将 points 填充为白色。
+        2. 使用 60x60 卷积核做 MORPH_CLOSE，填补小缺口。
+        3. 统计非零像素数得到面积；findContours 后对外部轮廓计算 arcLength。
+
+        :param img_h: 画布高度。
+        :param img_w: 画布宽度。
+        :param points: 多边形顶点列表，每项为 [x, y]。
+        :return: (area_pixel, perimeter_pixel)，若点数不足或异常则返回 (0.0, 0.0)。
+        """
         if len(points) < 3:
             return 0.0, 0.0
         try:
@@ -259,6 +325,12 @@ class ExcelDownloadService:
             return 0.0, 0.0
 
     def _calculate_shape_area(self, points: List[List[float]]) -> float:
+        """
+        使用鞋带公式（Shoelace formula）计算任意简单多边形的面积（像素单位）。
+
+        :param points: 多边形顶点列表，每项为 [x, y]，按顺时针或逆时针顺序排列。
+        :return: 多边形面积；当点数少于 3 时返回 0.0。
+        """
         if len(points) < 3:
             return 0.0
 
@@ -272,16 +344,39 @@ class ExcelDownloadService:
         return abs(area) / 2.0
 
     def _calculate_diameter_from_area(self, area: float) -> float:
+        """
+        假设茎秆截面近似圆形，根据面积反推等效直径 d = 2 * sqrt(area / π)。
+
+        :param area: 截面面积（像素或实际单位）。
+        :return: 等效直径；area <= 0 时返回 0.0。
+        """
         if area <= 0:
             return 0.0
         return 2 * math.sqrt(area / math.pi)
 
     def _calculate_perimeter_from_area(self, area: float) -> float:
+        """
+        假设茎秆截面近似圆形，根据面积反推等效周长 C = 2π * sqrt(area / π)。
+
+        :param area: 截面面积（像素或实际单位）。
+        :return: 等效周长；area <= 0 时返回 0.0。
+        """
         if area <= 0:
             return 0.0
         return 2 * math.pi * math.sqrt(area / math.pi)
 
     def generate_excel_data(self, analysis_data: Dict[str, Any], selected_columns: List[str]) -> pd.DataFrame:
+        """
+        根据用户选择的列从单条分析数据中抽取字段，构造单行 DataFrame 并将列名映射为中文。
+
+        - 对浮点值保留 6 位小数；
+        - 缺失字段以 "N/A" 填充；
+        - 若 selected_columns 中包含未定义列，则抛出 400 错误。
+
+        :param analysis_data: 单条样本的分析指标字典。
+        :param selected_columns: 用户选中的英文字段名列表，需全部存在于 available_columns。
+        :return: 列名为中文显示名的单行 DataFrame。
+        """
         invalid_columns = [col for col in selected_columns if col not in self.available_columns]
         if invalid_columns:
             raise HTTPException(status_code=400, detail=f"无效的列选择: {invalid_columns}")
@@ -306,7 +401,14 @@ class ExcelDownloadService:
 
     def create_excel_file(self, df: pd.DataFrame, filename: str = None) -> str:
         """
-        【优化】将 Excel 保存到磁盘，返回文件路径（给后台任务 + 文件流下载用）。
+        将给定 DataFrame 写入 Excel 文件并保存到存储目录下的 _exports 子目录。
+
+        自动调整每列宽度（最大不超过 50 字符），工作表固定命名为 "分析结果"。
+        若未指定文件名则以当前时间戳生成。
+
+        :param df: 待导出的 pandas DataFrame。
+        :param filename: 可选的输出文件名（含 .xlsx 后缀）。
+        :return: 保存后的 Excel 文件绝对路径。
         """
         if filename is None:
             filename = f"{datetime.now().strftime('%Y.%m.%d_%H:%M')}.xlsx"
@@ -336,6 +438,17 @@ class ExcelDownloadService:
         return file_path
 
     def export_all_to_excel(self, analysis_data_list: List[Dict[str, Any]], selected_columns: List[str], filename: str = None) -> str:
+        """
+        将多条样本的分析指标批量导出到一个 Excel 文件。
+
+        行为与 generate_excel_data 类似，但处理多条记录，最后委托 create_excel_file 落盘。
+        默认文件名格式：export_{样本数}_samples_{时间戳}.xlsx。
+
+        :param analysis_data_list: 多条样本的分析指标字典列表。
+        :param selected_columns: 用户选中的英文字段名列表，需全部存在于 available_columns。
+        :param filename: 可选的输出文件名。
+        :return: 保存后的 Excel 文件绝对路径。
+        """
         invalid_columns = [col for col in selected_columns if col not in self.available_columns]
         if invalid_columns:
             raise HTTPException(status_code=400, detail=f"无效的列选择: {invalid_columns}")

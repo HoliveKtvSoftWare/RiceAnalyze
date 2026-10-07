@@ -1,3 +1,7 @@
+"""
+Excel下载路由
+"""
+
 import uuid
 import os
 import re
@@ -109,6 +113,7 @@ async def export_all_analysis_to_excel(
                 scale=request_data.scale,
                 prefix="summary",
                 total=len(all_records),
+                user_id=str(user.id),
                 background_tasks=background_tasks,
             )
             return {
@@ -172,6 +177,7 @@ async def export_batch_to_excel(
                 scale=request_data.scale,
                 prefix="batch",
                 total=len(records),
+                user_id=str(user.id),
                 background_tasks=background_tasks,
             )
             return {
@@ -258,7 +264,43 @@ async def get_export_task_status(task_id: str):
         response["filename"] = task.get("filename")
     elif task["status"] == "failed":
         response["error"] = task.get("error", "未知错误")
+        response["message"] = task.get("message") or task.get("error")
+    elif task["status"] == "cancelled":
+        response["message"] = task.get("message", "任务已被用户取消")
+    elif task["status"] == "cancelling":
+        response["message"] = task.get("message", "任务正在停止...")
     return response
+
+
+@router.post("/tasks/{task_id}/cancel")
+async def cancel_export_task(
+        task_id: str,
+        user: UserTable = Depends(current_active_user),
+):
+    with _export_tasks_lock:
+        task = _export_tasks.get(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        if task.get("user_id") is not None and task["user_id"] != str(user.id):
+            raise HTTPException(status_code=403, detail="Cannot cancel a task belonging to another user")
+
+        if task["status"] in ("completed", "failed"):
+            raise HTTPException(status_code=409, detail="Task is already completed or failed, cannot cancel")
+
+        if task["status"] in ("cancelling", "cancelled"):
+            return {
+                "status": task["status"],
+                "message": "任务已标记为取消，正在停止..." if task["status"] == "cancelling" else "任务已被取消",
+            }
+
+        task["status"] = "cancelling"
+        task["message"] = "任务正在停止..."
+
+    return {
+        "status": "cancelling",
+        "message": "任务已标记为取消，正在停止...",
+    }
 
 
 @router.get("/download/{task_id}")
@@ -285,6 +327,7 @@ def _submit_async_export(
         scale: float,
         prefix: str,
         total: int,
+        user_id: Optional[str] = None,
         background_tasks: Optional[BackgroundTasks] = None,
 ) -> str:
     task_id = str(uuid.uuid4())
@@ -307,6 +350,8 @@ def _submit_async_export(
             "file_path": None,
             "filename": None,
             "error": None,
+            "message": None,
+            "user_id": user_id,
         }
 
     kwargs = dict(
@@ -327,6 +372,14 @@ def _submit_async_export(
     return task_id
 
 
+def _is_task_cancelled(task_id: str) -> bool:
+    with _export_tasks_lock:
+        task = _export_tasks.get(task_id)
+        if not task:
+            return False
+        return task["status"] in ("cancelling", "cancelled")
+
+
 def _run_export_worker(
         task_id: str,
         record_info_list: list,
@@ -340,6 +393,14 @@ def _run_export_worker(
 
         valid_data = []
         for idx, info in enumerate(record_info_list):
+            if _is_task_cancelled(task_id):
+                log.info(f"异步导出任务 {task_id} 已被取消，停止处理")
+                with _export_tasks_lock:
+                    if task_id in _export_tasks:
+                        _export_tasks[task_id]["status"] = "cancelled"
+                        _export_tasks[task_id]["message"] = "任务已被用户取消"
+                return
+
             record = _Analysis(
                 analysis_id=uuid.UUID(info["analysis_id"]),
                 original_file_path=info["original_file_path"],
@@ -355,6 +416,14 @@ def _run_export_worker(
                 if task_id in _export_tasks:
                     _export_tasks[task_id]["progress"] = idx + 1
 
+        if _is_task_cancelled(task_id):
+            log.info(f"异步导出任务 {task_id} 已被取消，停止处理")
+            with _export_tasks_lock:
+                if task_id in _export_tasks:
+                    _export_tasks[task_id]["status"] = "cancelled"
+                    _export_tasks[task_id]["message"] = "任务已被用户取消"
+            return
+
         if not valid_data:
             with _export_tasks_lock:
                 _export_tasks[task_id]["status"] = "failed"
@@ -367,6 +436,15 @@ def _run_export_worker(
 
         with _export_tasks_lock:
             if task_id in _export_tasks:
+                if _export_tasks[task_id]["status"] in ("cancelling", "cancelled"):
+                    _export_tasks[task_id]["status"] = "cancelled"
+                    _export_tasks[task_id]["message"] = "任务已被用户取消"
+                    try:
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+                    except Exception:
+                        pass
+                    return
                 _export_tasks[task_id]["status"] = "completed"
                 _export_tasks[task_id]["file_path"] = file_path
                 _export_tasks[task_id]["filename"] = filename
@@ -378,8 +456,12 @@ def _run_export_worker(
         log.error(f"异步导出任务 {task_id} 失败: {e}")
         with _export_tasks_lock:
             if task_id in _export_tasks:
-                _export_tasks[task_id]["status"] = "failed"
-                _export_tasks[task_id]["error"] = str(e)
+                if _export_tasks[task_id]["status"] in ("cancelling", "cancelled"):
+                    _export_tasks[task_id]["status"] = "cancelled"
+                    _export_tasks[task_id]["message"] = "任务已被用户取消"
+                else:
+                    _export_tasks[task_id]["status"] = "failed"
+                    _export_tasks[task_id]["error"] = str(e)
 
 
 def _do_export(records: list, selected_columns: List[str], unit: str, scale: float, prefix: str = "export") -> tuple:

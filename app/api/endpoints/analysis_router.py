@@ -115,95 +115,143 @@ async def get_analysis_history(
 
     return history_with_urls
 
-@router.post("/upload")
-async def upload_image(
-    tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    model_name: Optional[str] = Form(None),
-    user: UserTable = Depends(current_active_user),
-    db: AsyncSession = Depends(get_async_session)
-):
-    """
-    接收用户上传：保存文件，创建记录，提交后台任务。
-    单文件上传时自动创建批次。
-
-    Form 字段:
-        file: 上传的图片文件
-        model_name: 用户选择的模型名称（对应 /models 返回的 name），可选；不传则使用默认模型
-    """
-    log.info(f"收到上传请求: model_name={model_name}, file={file.filename}")
-
-    _validate_model(model_name)
-
-    # 创建批次（单文件上传也创建批次，保持一致性）
-    batch_uuid = uuid.uuid4()
-    new_batch = UploadBatch(
-        batch_id=batch_uuid,
-        file_count=1,
-        user_id=user.id
-    )
-    db.add(new_batch)
-    await db.commit()
-    await db.refresh(new_batch)
-    log.info(f"创建批次成功: {new_batch.batch_id}")
-
-    originals_dir = os.path.join(settings.STORAGE_PATH, "originals", str(user.id))
-    os.makedirs(originals_dir, exist_ok=True)
-
+async def _save_single_file(file: UploadFile, originals_dir: str, index: int) -> tuple:
+    """保存单个文件并返回 (saved_file_path, unique_filename_base)"""
     analysis_uuid = uuid.uuid4()
     clean_filename = os.path.basename(file.filename).replace('/', '_').replace('\\', '_')
-    # 在文件名中添加上传时间（格式：YYYYMMDD_HHMMSS）
     upload_time = datetime.now().strftime("%Y%m%d_%H%M%S")
     name, ext = os.path.splitext(clean_filename)
     unique_filename_base = f"{analysis_uuid}_{name}_{upload_time}{ext}"
     saved_file_path = os.path.join(originals_dir, unique_filename_base)
 
-    log.info(f"正在保存上传的文件至: {saved_file_path} (原始名: {file.filename})")
+    log.info(f"正在保存文件 {index} 至: {saved_file_path} (原始名: {file.filename})")
     try:
         with open(saved_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
     except Exception as e:
-        log.error(f"保存文件失败: {e}")
-        raise HTTPException(status_code=500, detail="无法保存上传的文件。")
+        log.error(f"保存文件 {file.filename} 失败: {e}")
+        raise HTTPException(status_code=500, detail=f"无法保存文件 {file.filename}。")
 
-    log.info(f"正在为用户 {user.id} 创建分析记录...")
-    new_analysis = Analysis(
-        analysis_id=analysis_uuid,
-        user_id=user.id,
-        status="processing",
-        original_file_path=saved_file_path,
+    return saved_file_path, unique_filename_base, analysis_uuid
+
+
+async def _create_batch(db: AsyncSession, user: UserTable, file_count: int) -> UploadBatch:
+    """创建一个 UploadBatch 记录"""
+    batch_uuid = uuid.uuid4()
+    new_batch = UploadBatch(
         batch_id=batch_uuid,
-        batch_index=0,
-        model_used=model_name if model_name else "default"
+        file_count=file_count,
+        user_id=user.id
     )
-    db.add(new_analysis)
+    db.add(new_batch)
     await db.commit()
-    await db.refresh(new_analysis)
-    log.info(f"分析记录创建成功: {new_analysis.analysis_id}")
+    await db.refresh(new_batch)
+    log.info(f"创建批次成功: {new_batch.batch_id}, 文件数量: {file_count}")
+    return new_batch
 
-    log.debug(f"即将添加后台任务: run_full_analysis for analysis_id={new_analysis.analysis_id}")
+
+def _add_analysis_task(
+    tasks: BackgroundTasks,
+    analysis: Analysis,
+    saved_file_path: str,
+    user: UserTable,
+    unique_filename_base: str,
+    model_name: Optional[str]
+) -> None:
+    """提交后台分析任务"""
     try:
         tasks.add_task(
             run_full_analysis,
-            analysis_id=str(new_analysis.analysis_id),
+            analysis_id=str(analysis.analysis_id),
             original_file_path=saved_file_path,
             user_id=str(user.id),
             original_filename=unique_filename_base,
             model_name=model_name
         )
-        log.debug(f"后台任务 run_full_analysis 添加成功 for analysis_id={new_analysis.analysis_id}")
     except Exception as e:
-         log.error(f"添加后台任务时发生错误: {e}", exc_info=True)
-         raise HTTPException(status_code=500, detail="无法启动后台分析任务。")
+        log.error(f"添加后台任务时发生错误: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="无法启动后台分析任务。")
 
-    log.info(f"任务 {new_analysis.analysis_id} 已成功提交到后台。")
+
+@router.post("/upload")
+async def upload_adaptive(
+    tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+    model_name: Optional[str] = Form(None),
+    user: UserTable = Depends(current_active_user),
+    db: AsyncSession = Depends(get_async_session)
+):
+    """
+    自适应上传接口：同时支持单文件和多文件上传，根据前端传入的文件数量自动适配处理逻辑。
+
+    Form 字段:
+        files: 上传的图片文件列表（单文件时也用同样的字段名即可）
+        model_name: 用户选择的模型名称，可选；不传则使用默认模型
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="未上传任何文件")
+
+    is_single = len(files) == 1
+    log.info(
+        f"收到上传请求: model_name={model_name}, 文件数={len(files)} "
+        f"({'单文件模式' if is_single else '批量模式'})"
+    )
+
+    _validate_model(model_name)
+
+    batch = await _create_batch(db, user, len(files))
+
+    originals_dir = os.path.join(settings.STORAGE_PATH, "originals", str(user.id))
+    os.makedirs(originals_dir, exist_ok=True)
+
+    analyses_info = []
+
+    for index, file in enumerate(files):
+        saved_file_path, unique_filename_base, analysis_uuid = await _save_single_file(
+            file, originals_dir, index + 1
+        )
+
+        new_analysis = Analysis(
+            analysis_id=analysis_uuid,
+            user_id=user.id,
+            status="processing",
+            original_file_path=saved_file_path,
+            batch_id=batch.batch_id,
+            batch_index=index,
+            model_used=model_name if model_name else "default"
+        )
+        db.add(new_analysis)
+        await db.commit()
+        await db.refresh(new_analysis)
+
+        _add_analysis_task(
+            tasks, new_analysis, saved_file_path, user, unique_filename_base, model_name
+        )
+
+        analyses_info.append({
+            "analysis_id": new_analysis.analysis_id,
+            "original_filename": file.filename
+        })
+
+    default_model = model_name if model_name else "default"
+
+    if is_single:
+        return {
+            "message": "文件已成功提交后台处理。",
+            "analysis_id": analyses_info[0]["analysis_id"],
+            "batch_id": batch.batch_id,
+            "original_filename": analyses_info[0]["original_filename"],
+            "model_used": default_model
+        }
+
     return {
-        "message": "文件已成功提交后台处理。",
-        "analysis_id": new_analysis.analysis_id,
-        "batch_id": batch_uuid,
-        "original_filename": file.filename,
-        "model_used": model_name if model_name else "default"
+        "message": f"{len(files)} 个文件已成功提交后台处理。",
+        "batch_id": batch.batch_id,
+        "total_files": len(files),
+        "model_used": default_model,
+        "analyses": analyses_info
     }
+
 
 @router.post("/upload/batch")
 async def upload_images_batch(
@@ -214,95 +262,10 @@ async def upload_images_batch(
     db: AsyncSession = Depends(get_async_session)
 ):
     """
-    批量上传图片：创建批次，保存文件，创建记录，提交后台任务。
-
-    Form 字段:
-        files: 多个上传的图片文件
-        model_name: 用户选择的模型名称，可选；不传则使用默认模型
+    批量上传的兼容接口，内部委托给自适应上传接口。
+    保留此路由是为了向后兼容已有前端代码。
     """
-    log.info(f"收到批量上传请求: model_name={model_name}, 文件数={len(files)}")
-
-    _validate_model(model_name)
-
-    if not files:
-        raise HTTPException(status_code=400, detail="未上传任何文件")
-
-    # 创建批次
-    batch_uuid = uuid.uuid4()
-    new_batch = UploadBatch(
-        batch_id=batch_uuid,
-        file_count=len(files),
-        user_id=user.id
-    )
-    db.add(new_batch)
-    await db.commit()
-    await db.refresh(new_batch)
-    log.info(f"创建批次成功: {new_batch.batch_id}, 文件数量: {len(files)}")
-
-    originals_dir = os.path.join(settings.STORAGE_PATH, "originals", str(user.id))
-    os.makedirs(originals_dir, exist_ok=True)
-
-    submitted_analyses = []
-
-    for index, file in enumerate(files):
-        analysis_uuid = uuid.uuid4()
-        clean_filename = os.path.basename(file.filename).replace('/', '_').replace('\\', '_')
-        # 在文件名中添加上传时间（格式：YYYYMMDD_HHMMSS）
-        upload_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-        name, ext = os.path.splitext(clean_filename)
-        unique_filename_base = f"{analysis_uuid}_{name}_{upload_time}{ext}"
-        saved_file_path = os.path.join(originals_dir, unique_filename_base)
-
-        log.info(f"正在保存上传的文件 {index+1}/{len(files)} 至: {saved_file_path} (原始名: {file.filename})")
-        try:
-            with open(saved_file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-        except Exception as e:
-            log.error(f"保存文件 {file.filename} 失败: {e}")
-            raise HTTPException(status_code=500, detail=f"无法保存文件 {file.filename}。")
-
-        log.info(f"正在为用户 {user.id} 创建分析记录...")
-        new_analysis = Analysis(
-            analysis_id=analysis_uuid,
-            user_id=user.id,
-            status="processing",
-            original_file_path=saved_file_path,
-            batch_id=batch_uuid,
-            batch_index=index,
-            model_used=model_name if model_name else "default"
-        )
-        db.add(new_analysis)
-        await db.commit()
-        await db.refresh(new_analysis)
-        log.info(f"分析记录创建成功: {new_analysis.analysis_id}")
-
-        # 添加后台任务
-        try:
-            tasks.add_task(
-                run_full_analysis,
-                analysis_id=str(new_analysis.analysis_id),
-                original_file_path=saved_file_path,
-                user_id=str(user.id),
-                original_filename=unique_filename_base,
-                model_name=model_name
-            )
-        except Exception as e:
-            log.error(f"添加后台任务时发生错误: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail="无法启动后台分析任务。")
-
-        submitted_analyses.append({
-            "analysis_id": new_analysis.analysis_id,
-            "original_filename": file.filename
-        })
-
-    log.info(f"批次 {batch_uuid} 中 {len(files)} 个任务已成功提交到后台。")
-    return {
-        "message": f"{len(files)} 个文件已成功提交后台处理。",
-        "batch_id": batch_uuid,
-        "total_files": len(files),
-        "model_used": model_name if model_name else "default",
-        "analyses": submitted_analyses
-    }
+    return await upload_adaptive(tasks, files, model_name, user, db)
 
 @router.delete("/delete/{analysis_id}")
 async def delete_analysis(
@@ -328,7 +291,6 @@ async def delete_analysis(
             log.warning(f"分析记录 {analysis_id} 不存在或不属于用户 {user.id}")
             raise HTTPException(status_code=404, detail="分析记录不存在或无权操作")
 
-        # 删除相关文件
         files_to_delete = [
             analysis.original_file_path,
             analysis.annotated_image_path,
@@ -343,7 +305,16 @@ async def delete_analysis(
                 except Exception as e:
                     log.error(f"删除文件 {file_path} 时出错: {e}")
 
-        # 删除数据库记录
+        for file_path in files_to_delete:
+            if file_path:
+                parent_dir = os.path.dirname(file_path)
+                if parent_dir and os.path.isdir(parent_dir):
+                    try:
+                        os.rmdir(parent_dir)
+                        log.info(f"已删除空目录: {parent_dir}")
+                    except OSError:
+                        pass
+
         await db.delete(analysis)
         await db.commit()
         log.info(f"分析记录 {analysis_id} 已成功删除")
@@ -400,6 +371,16 @@ async def delete_analyses_batch(
                             os.remove(file_path)
                         except Exception as e:
                             log.error(f"删除文件 {file_path} 时出错: {e}")
+
+                for file_path in files_to_delete:
+                    if file_path:
+                        parent_dir = os.path.dirname(file_path)
+                        if parent_dir and os.path.isdir(parent_dir):
+                            try:
+                                os.rmdir(parent_dir)
+                                log.info(f"已删除空目录: {parent_dir}")
+                            except OSError:
+                                pass
 
                 await db.delete(analysis)
                 deleted_count += 1
