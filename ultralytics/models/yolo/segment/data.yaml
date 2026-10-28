@@ -1,0 +1,17 @@
+train: /public/zhuxiaoying/shuidao/shuidao_new/train/images
+val: /public/zhuxiaoying/shuidao/shuidao_new/val/images
+test: /public/zhuxiaoying/shuidao/shuidao_new/test/images
+
+nc: 4
+names: [
+'small',
+'in',
+'big',
+'out']
+
+# roboflow:
+#   workspace: mohammad-hemeida-mkj5z
+#   project: class-test-3
+#   version: 1
+#   license: CC BY 4.0
+#   url: https://universe.roboflow.com/mohammad-hemeida-mkj5z/class-test-3/dataset/1
