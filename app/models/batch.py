@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import datetime
+from typing import Optional
 from sqlmodel import Field, SQLModel
 
 
@@ -17,6 +18,7 @@ class UploadBatch(SQLModel, table=True):
     # --- 核心字段 ---
     id: int = Field(default=None, primary_key=True, index=True)
     batch_id: uuid.UUID = Field(default_factory=uuid.uuid4, unique=True, index=True, description="批次唯一标识")
+    batch_name: Optional[str] = Field(default=None, description="批次名称，通常为用户上传的顶层文件夹名")
     file_count: int = Field(default=0, description="批次中的文件数量")
     created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False, description="创建时间")
 

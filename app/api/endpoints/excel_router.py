@@ -6,12 +6,12 @@ import uuid
 import os
 import re
 import threading
-import io
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from urllib.parse import quote
-from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Query
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse
 import logging
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -20,6 +20,20 @@ from app.models.user import UserTable
 from app.auth.db import get_async_session
 from app.models.analysis import Analysis
 from app.services.excel_download import excel_service
+from app.services.leaf_excel import leaf_excel_service
+
+EXCEL_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _group_key(group: Optional[str]) -> str:
+    """规范化分析大类：leaf=剑叶，其余一律按 stem（茎秆）处理。"""
+    return "leaf" if (group or "").strip().lower() == "leaf" else "stem"
+
+
+def _service_for(group: Optional[str]):
+    """按分析大类返回对应的导出服务（列定义 + 指标口径都在服务里）。"""
+    return leaf_excel_service if _group_key(group) == "leaf" else excel_service
+
 
 def _extract_real_name(original_file_path: str) -> str:
     basename = os.path.basename(original_file_path)
@@ -37,16 +51,18 @@ def _build_cd(filename: str) -> str:
     utf8_name = quote(filename)
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}"
 
-def _file_to_streaming_response(file_path: str, filename: str, media_type: str) -> StreamingResponse:
-    with open(file_path, 'rb') as f:
-        data = f.read()
-    return StreamingResponse(
-        io.BytesIO(data),
+def _file_to_streaming_response(file_path: str, filename: str, media_type: str) -> FileResponse:
+    """
+    用 FileResponse 直接流式发送文件。
+
+    旧实现会把整个 xlsx 读进内存再包一层 BytesIO，既多占一份内存，
+    又多一次全量拷贝；FileResponse 由 Starlette 在线程池中分块读取，
+    首字节更快，也不受文件大小影响。
+    """
+    return FileResponse(
+        file_path,
         media_type=media_type,
-        headers={
-            "Content-Disposition": _build_cd(filename),
-            "Content-Length": str(len(data))
-        }
+        headers={"Content-Disposition": _build_cd(filename)},
     )
 from pydantic import BaseModel
 
@@ -61,8 +77,10 @@ _export_tasks_lock = threading.Lock()
 
 class ExportRequest(BaseModel):
     selectedColumns: List[str]
-    unit: str = "um"
+    unit: str = "μm"
     scale: float = 500.0
+    # stem=茎秆（默认） / leaf=剑叶：决定用哪套列定义与指标口径
+    group: str = "stem"
 
 
 class AsyncExportRequest(ExportRequest):
@@ -73,15 +91,18 @@ class BatchExportRequest(BaseModel):
     analysisIds: Optional[List[str]] = None
     allCompleted: bool = False
     selectedColumns: List[str]
-    unit: str = "um"
+    unit: str = "μm"
     scale: float = 500.0
     asyncMode: bool = False
+    group: str = "stem"
 
 
 @router.get("/columns")
-async def get_export_columns():
+async def get_export_columns(group: str = Query("stem", description="stem=茎秆 / leaf=剑叶")):
+    service = _service_for(group)
     return {
-        "available_columns": excel_service.get_available_columns(),
+        "available_columns": service.get_available_columns(),
+        "group": _group_key(group),
         "message": "可导出的列配置"
     }
 
@@ -94,9 +115,11 @@ async def export_all_analysis_to_excel(
         background_tasks: BackgroundTasks = None
 ):
     try:
+        group = _group_key(request_data.group)
         statement = select(Analysis).where(
             Analysis.user_id == user.id,
-            Analysis.status == "completed"
+            Analysis.status == "completed",
+            Analysis.task_type == group
         ).order_by(Analysis.created_at.desc())
 
         result = await db.execute(statement)
@@ -115,6 +138,7 @@ async def export_all_analysis_to_excel(
                 total=len(all_records),
                 user_id=str(user.id),
                 background_tasks=background_tasks,
+                group=group,
             )
             return {
                 "success": True,
@@ -124,15 +148,19 @@ async def export_all_analysis_to_excel(
                 "downloadUrl": f"/api/excel/download/{task_id}",
             }
 
-        file_path, filename = _do_export(
+        # 同步导出（pandas / openpyxl / 图片解码）必须放到线程池，
+        # 否则在 async 端点里直接调用会阻塞整个事件循环，所有其它请求一起卡住。
+        file_path, filename = await run_in_threadpool(
+            _do_export,
             records=all_records,
             selected_columns=request_data.selectedColumns,
             unit=request_data.unit,
             scale=request_data.scale,
             prefix="summary",
+            group=group,
         )
 
-        return _file_to_streaming_response(file_path, filename, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        return _file_to_streaming_response(file_path, filename, EXCEL_MEDIA_TYPE)
 
     except HTTPException:
         raise
@@ -149,16 +177,19 @@ async def export_batch_to_excel(
         background_tasks: BackgroundTasks = None
 ):
     try:
+        group = _group_key(request_data.group)
         if request_data.allCompleted:
             statement = select(Analysis).where(
                 Analysis.user_id == user.id,
-                Analysis.status == "completed"
+                Analysis.status == "completed",
+                Analysis.task_type == group
             ).order_by(Analysis.created_at.desc())
         elif request_data.analysisIds:
             statement = select(Analysis).where(
                 Analysis.analysis_id.in_(request_data.analysisIds),
                 Analysis.user_id == user.id,
-                Analysis.status == "completed"
+                Analysis.status == "completed",
+                Analysis.task_type == group
             )
         else:
             raise HTTPException(status_code=400, detail="请传入 analysisIds 或设置 allCompleted=true")
@@ -179,6 +210,7 @@ async def export_batch_to_excel(
                 total=len(records),
                 user_id=str(user.id),
                 background_tasks=background_tasks,
+                group=group,
             )
             return {
                 "success": True,
@@ -188,15 +220,17 @@ async def export_batch_to_excel(
                 "downloadUrl": f"/api/excel/download/{task_id}",
             }
 
-        file_path, filename = _do_export(
+        file_path, filename = await run_in_threadpool(
+            _do_export,
             records=records,
             selected_columns=request_data.selectedColumns,
             unit=request_data.unit,
             scale=request_data.scale,
             prefix="batch",
+            group=group,
         )
 
-        return _file_to_streaming_response(file_path, filename, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        return _file_to_streaming_response(file_path, filename, EXCEL_MEDIA_TYPE)
 
     except HTTPException:
         raise
@@ -227,16 +261,20 @@ async def export_analysis_to_excel(
         if analysis.status != "completed":
             raise HTTPException(status_code=400, detail="分析记录尚未完成，无法导出")
 
-        analysis_data = excel_service.load_analysis_data_from_record(analysis, request_data.unit, request_data.scale)
-        df = excel_service.generate_excel_data(analysis_data, request_data.selectedColumns)
+        # 以记录自身的分析类型为准，避免前端传错 group 导致口径串台
+        group = _group_key(analysis.task_type or request_data.group)
 
-        real_name = _extract_real_name(analysis.original_file_path)
-        now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"茎秆_{real_name}_{now_str}_{request_data.unit}.xlsx"
+        # 图片解码 / 几何计算 / Excel 生成同样是重 CPU 操作，放到线程池执行
+        file_path, filename = await run_in_threadpool(
+            _build_single_export,
+            analysis,
+            request_data.unit,
+            request_data.scale,
+            request_data.selectedColumns,
+            group,
+        )
 
-        file_path = excel_service.create_excel_file(df, filename)
-
-        return _file_to_streaming_response(file_path, filename, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        return _file_to_streaming_response(file_path, filename, EXCEL_MEDIA_TYPE)
 
     except HTTPException:
         raise
@@ -329,8 +367,10 @@ def _submit_async_export(
         total: int,
         user_id: Optional[str] = None,
         background_tasks: Optional[BackgroundTasks] = None,
+        group: str = "stem",
 ) -> str:
     task_id = str(uuid.uuid4())
+    group = _group_key(group)
 
     record_info_list = [
         {
@@ -361,6 +401,7 @@ def _submit_async_export(
         unit=unit,
         scale=scale,
         prefix=prefix,
+        group=group,
     )
 
     if background_tasks is not None:
@@ -387,9 +428,14 @@ def _run_export_worker(
         unit: str,
         scale: float,
         prefix: str,
+        group: str = "stem",
 ):
     try:
         from app.models.analysis import Analysis as _Analysis
+
+        service = _service_for(group)
+        group = _group_key(group)
+        label = "剑叶" if group == "leaf" else "茎秆"
 
         valid_data = []
         for idx, info in enumerate(record_info_list):
@@ -407,7 +453,7 @@ def _run_export_worker(
                 result_json_path=info["result_json_path"],
             )
             try:
-                data = excel_service.load_analysis_data_from_record(record, unit, scale)
+                data = service.load_analysis_data_from_record(record, unit, scale)
                 valid_data.append(data)
             except Exception as e:
                 log.warning(f"异步导出跳过记录 {info['analysis_id']}: {e}")
@@ -431,8 +477,8 @@ def _run_export_worker(
             return
 
         now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"茎秆_{len(valid_data)}个文件_{now_str}_{unit}.xlsx"
-        file_path = excel_service.export_all_to_excel(valid_data, selected_columns, filename)
+        filename = f"{label}_{len(valid_data)}个文件_{now_str}_{unit}.xlsx"
+        file_path = service.export_all_to_excel(valid_data, selected_columns, filename)
 
         with _export_tasks_lock:
             if task_id in _export_tasks:
@@ -464,11 +510,32 @@ def _run_export_worker(
                     _export_tasks[task_id]["error"] = str(e)
 
 
-def _do_export(records: list, selected_columns: List[str], unit: str, scale: float, prefix: str = "export") -> tuple:
+def _build_single_export(analysis: Analysis, unit: str, scale: float, selected_columns: List[str],
+                         group: str = "stem") -> tuple:
+    """单条记录的 Excel 生成（同步函数，由线程池调用）。"""
+    service = _service_for(group)
+    label = "剑叶" if _group_key(group) == "leaf" else "茎秆"
+
+    analysis_data = service.load_analysis_data_from_record(analysis, unit, scale)
+    df = service.generate_excel_data(analysis_data, selected_columns)
+
+    real_name = _extract_real_name(analysis.original_file_path)
+    now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{label}_{real_name}_{now_str}_{unit}.xlsx"
+
+    file_path = service.create_excel_file(df, filename)
+    return file_path, filename
+
+
+def _do_export(records: list, selected_columns: List[str], unit: str, scale: float,
+               prefix: str = "export", group: str = "stem") -> tuple:
+    service = _service_for(group)
+    label = "剑叶" if _group_key(group) == "leaf" else "茎秆"
+
     valid_data = []
     for record in records:
         try:
-            data = excel_service.load_analysis_data_from_record(record, unit, scale)
+            data = service.load_analysis_data_from_record(record, unit, scale)
             valid_data.append(data)
         except Exception as e:
             log.warning(f"导出中跳过记录 {record.analysis_id}: {e}")
@@ -478,7 +545,7 @@ def _do_export(records: list, selected_columns: List[str], unit: str, scale: flo
         raise HTTPException(status_code=404, detail="没有成功加载任何分析数据")
 
     now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"茎秆_{len(valid_data)}个文件_{now_str}_{unit}.xlsx"
-    file_path = excel_service.export_all_to_excel(valid_data, selected_columns, filename)
+    filename = f"{label}_{len(valid_data)}个文件_{now_str}_{unit}.xlsx"
+    file_path = service.export_all_to_excel(valid_data, selected_columns, filename)
     log.info(f"Excel 导出完成: {file_path}（成功 {len(valid_data)}/{len(records)}）")
     return file_path, filename

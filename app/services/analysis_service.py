@@ -16,13 +16,20 @@ from app.models.analysis import Analysis
 # 设置日志
 log = logging.getLogger(__name__)
 
-# 创建一个同步的数据库引擎
+# 创建一个同步的数据库引擎（后台任务在独立线程中执行，使用同步驱动更简单）
+# pool_pre_ping: 避免复用被数据库服务端回收的连接，导致任务状态更新偶发变慢
 sync_db_url = settings.DATABASE_URL.replace("+asyncpg", "")
-sync_engine = create_engine(sync_db_url, echo=False)
+sync_engine = create_engine(
+    sync_db_url,
+    echo=False,
+    pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=10,
+)
 
 # 确认函数定义包含了 original_filename: str
 def run_full_analysis(analysis_id: str, original_file_path: str, user_id: str, original_filename: str, model_name:
-Optional[str] = None):
+Optional[str] = None, batch_id: Optional[str] = None, task_type: str = "stem"):
     """
     后台任务主函数，使用原始文件名进行输出。
 
@@ -31,28 +38,63 @@ Optional[str] = None):
         original_file_path: 原图存储路径
         user_id: 用户 UUID
         original_filename: 原始文件名（含时间戳）
-        model_name: 用户选择的模型名称（对应 .env 中 YOLO_MODELS 的 key）
+        model_name: 用户选择的模型名称（茎秆对应 YOLO_MODELS，剑叶对应 LEAF_MODELS 的 key）
+        batch_id: 批次 UUID，用于组织输出目录结构
+        task_type: 分析类型，``stem``（茎秆截面，默认）或 ``leaf``（剑叶）；
+            决定用哪套模型注册表与渲染配色
     """
+    task_type = (task_type or "stem").strip().lower()
+    if task_type not in ("stem", "leaf"):
+        task_type = "stem"
     try:
-        log.info(f"--- [任务 {analysis_id}] 开始处理 (原始文件名: {original_filename}, 模型: {model_name}) ---")
+        log.info(
+            f"--- [任务 {analysis_id}] 开始处理 (类型: {task_type}, "
+            f"原始文件名: {original_filename}, 模型: {model_name}) ---"
+        )
 
-        # 步骤 1: 根据 model_name 解析出实际模型路径
-        model_path = settings.get_model_path(model_name)
-        log.info(f"解析模型: model_name={model_name} -> model_path={model_path}")
+        # 步骤 1: 根据分析类型 + model_name 解析出实际模型路径
+        if task_type == "leaf":
+            model_path = settings.get_leaf_model_path(model_name)
+        else:
+            model_path = settings.get_model_path(model_name)
+        log.info(f"解析模型: task_type={task_type}, model_name={model_name} -> model_path={model_path}")
 
         # 步骤 2: 准备本次任务专属的输出文件夹
         original_filename_without_ext = os.path.splitext(original_filename)[0]
-        output_dir = os.path.join(settings.STORAGE_PATH, user_id, original_filename_without_ext)
+        if batch_id:
+            output_dir = os.path.join(settings.STORAGE_PATH, user_id, batch_id)
+        else:
+            output_dir = os.path.join(settings.STORAGE_PATH, user_id, original_filename_without_ext)
         os.makedirs(output_dir, exist_ok=True)
         log.info(f"输出目录已创建: {output_dir}")
 
         # 步骤 3: 调用 YOLO 推理服务
+        # 茎秆沿用原来的多边形平滑与四类配色；剑叶用 11 类自定义配色、不平滑
+        # （平滑会改变周长口径，剑叶周长直接按多边形弦长求和）。
+        # 剑叶额外对齐 V2 的推理/后处理参数：
+        #   retina_masks=True  -> 高分辨率掩膜，轮廓更细
+        #   iou=0.45           -> NMS 更严，减少同一结构被重复检测
+        #   filter_small_components + min_mask_area_px=64 -> 去掉掩膜内噪点和微小的误检实例
         log.info(f"开始执行 YOLO 推理... 图片: {original_file_path}")
+        inference_kwargs = {}
+        if task_type == "leaf":
+            from app.services.leaf_analysis import LEAF_COLORS
+
+            inference_kwargs = {
+                "smooth": False,
+                "colors": LEAF_COLORS,
+                "conf": 0.25,
+                "iou": 0.45,
+                "retina_masks": True,
+                "filter_small_components": True,
+                "min_mask_area_px": 64,
+            }
         annotated_image_path, json_output_path = run_system(
             model_path=model_path,
             image_path=original_file_path,
             output_path=output_dir,
-            output_basename=original_filename_without_ext
+            output_basename=original_filename_without_ext,
+            **inference_kwargs
         )
         log.info(f"YOLO 推理完成。JSON 已保存至: {json_output_path}")
 
@@ -63,9 +105,12 @@ Optional[str] = None):
             analysis_record = session.exec(statement).one()
 
             analysis_record.status = "completed"
+            analysis_record.task_type = task_type
             analysis_record.annotated_image_path = annotated_image_path
             analysis_record.result_json_path = json_output_path
             analysis_record.model_used = model_name if model_name else "default"
+            # 重跑/重试成功时清掉历史失败原因，避免“已完成但还挂着旧报错”
+            analysis_record.error_message = None
             analysis_record.updated_at = datetime.utcnow()
 
             session.add(analysis_record)

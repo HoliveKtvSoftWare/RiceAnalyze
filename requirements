@@ -100,12 +100,10 @@ pytz==2025.2
 pywavelets==1.4.1
 pyyaml==6.0.2
 qtpy==2.4.3
-redis==6.1.1
 requests==2.32.4
 rich==14.1.0
 rich-toolkit==0.15.1
 rignore==0.6.4
-rq==2.3.3
 scikit-image==0.21.0
 scipy==1.10.1
 seaborn==0.13.2

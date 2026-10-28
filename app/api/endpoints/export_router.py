@@ -3,15 +3,17 @@
 """
 
 from fastapi import APIRouter, HTTPException, Depends, Body, Query
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse, FileResponse
 from sqlmodel import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 import os
 import re
 import json
 import logging
+import tempfile
+import zipfile
 from datetime import datetime
-import io
 from typing import List, Optional
 from pydantic import BaseModel
 from urllib.parse import quote
@@ -54,26 +56,29 @@ def get_json_data(json_path):
 
 
 def export_json_response(json_path, download_name=None):
-    data = get_json_data(json_path)
-    json_str = json.dumps(data, ensure_ascii=False, indent=2)
+    """
+    直接以文件流的方式返回 JSON 文件。
 
+    旧实现会先 json.load 再 json.dumps(indent=2)：分析结果里带有
+    几 MB 的 base64 图像数据，这一步既耗时又要占用多份内存，
+    而且发生在事件循环线程里，会把并发请求一起拖慢。
+    这里直接发送原始文件，内容和 LabmeMe 实际使用的完全一致。
+    """
     if download_name is None:
         download_name = "export.json"
 
-    return StreamingResponse(
-        io.BytesIO(json_str.encode('utf-8')),
+    return FileResponse(
+        json_path,
         media_type="application/octet-stream",
-        headers={
-            "Content-Disposition": build_content_disposition(download_name),
-            "Content-Length": str(len(json_str))
-        }
+        headers={"Content-Disposition": build_content_disposition(download_name)},
     )
 
 
-def get_json_statistics(json_path):
-    """获取JSON文件的统计信息"""
+def get_json_statistics(json_path, data=None):
+    """获取JSON文件的统计信息（可传入已解析的数据，避免重复读取大文件）"""
     try:
-        data = get_json_data(json_path)
+        if data is None:
+            data = get_json_data(json_path)
         file_stat = os.stat(json_path)
 
         label_counts = {}
@@ -93,6 +98,34 @@ def get_json_statistics(json_path):
         }
     except Exception as e:
         return {'error': str(e)}
+
+
+def _load_json_and_stats(json_path):
+    """读取一次 JSON，同时返回统计信息（同步函数，供线程池调用）。"""
+    data = get_json_data(json_path)
+    return data, get_json_statistics(json_path, data=data)
+
+
+def _build_zip_file(json_files, zip_filename) -> str:
+    """
+    把多个 JSON 打包成 zip，写入临时文件（同步函数，供线程池调用）。
+
+    写临时文件而不是内存 BytesIO：大批量导出时不会把整个压缩包留在内存里，
+    同时 FileResponse 可以分块发送，浏览器能立即开始下载。
+    """
+    fd, temp_path = tempfile.mkstemp(suffix=".zip", prefix="rice_export_")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zipf:
+            for file_info in json_files:
+                zipf.write(file_info['path'], file_info['name'])
+    except Exception:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise
+    return temp_path
 
 
 def _format_size(size_bytes):
@@ -179,15 +212,17 @@ async def preview_analysis_json(
         if not analysis.result_json_path or not os.path.exists(analysis.result_json_path):
             raise HTTPException(status_code=404, detail="JSON文件不存在")
 
-        data = get_json_data(analysis.result_json_path)
-        stats = get_json_statistics(analysis.result_json_path)
+        # 大 JSON（含 base64 图像数据）的解析放到线程池，避免阻塞事件循环
+        data, stats = await run_in_threadpool(
+            _load_json_and_stats, analysis.result_json_path
+        )
 
         return JSONResponse({
             'success': True,
             'data': data,
             'statistics': stats,
             'analysis_info': {
-                'analysis_id': analysis.analysis_id,
+                'analysis_id': str(analysis.analysis_id),
                 'original_filename': os.path.basename(analysis.original_file_path),
                 'created_at': analysis.created_at.isoformat() if analysis.created_at else None,
                 'status': analysis.status
@@ -320,22 +355,17 @@ async def export_batch_json(
                 detail="没有可导出的JSON文件"
             )
 
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for file_info in json_files:
-                zipf.write(file_info['path'], file_info['name'])
-
-        zip_buffer.seek(0)
-
         now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         zip_filename = f"{len(json_files)}个文件_{now_str}.zip"
 
-        return StreamingResponse(
-            zip_buffer,
+        zip_path = await run_in_threadpool(_build_zip_file, json_files, zip_filename)
+
+        from starlette.background import BackgroundTask
+        return FileResponse(
+            zip_path,
             media_type="application/zip",
-            headers={
-                "Content-Disposition": build_content_disposition(zip_filename)
-            }
+            headers={"Content-Disposition": build_content_disposition(zip_filename)},
+            background=BackgroundTask(lambda: os.path.exists(zip_path) and os.remove(zip_path)),
         )
 
     except HTTPException:

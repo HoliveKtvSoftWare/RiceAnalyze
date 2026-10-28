@@ -14,6 +14,9 @@ class Analysis(SQLModel, table=True):
     # --- 核心字段 ---
     analysis_id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True, index=True)
     status: str = Field(default="pending", index=True) # 任务状态: pending, processing, queued, completed, failed
+    # 分析类型：stem=茎秆截面 / leaf=剑叶。历史记录、模型列表、导出都按它分流，
+    # 保证两个页面的数据互不串台。
+    task_type: str = Field(default="stem", index=True)
     created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
     updated_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
 
