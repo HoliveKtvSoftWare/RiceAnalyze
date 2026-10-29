@@ -133,7 +133,7 @@ app.include_router(analysis_router.router, prefix="/api/analysis", tags=["Analys
 app.include_router(excel_router.router, prefix="/api/excel", tags=["Excel"])
 
 # 🆕 挂载JSON导出路由（新增这行）
-app.include_router(export_router.router, tags=["Export"])
+app.include_router(export_json_router.router, tags=["Export"])
 
 # 配置静态文件
 static_dir = settings.STORAGE_PATH

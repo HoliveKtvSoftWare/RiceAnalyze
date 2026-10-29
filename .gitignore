@@ -12,3 +12,9 @@
 
 # 推送时忽略其他临时文件
 __pycache__/
+
+# 推送时忽略环境变量文件
+.env
+
+# 推送时忽略 ultralytics 库文件
+ultralytics/

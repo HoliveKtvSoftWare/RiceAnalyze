@@ -15,6 +15,7 @@ from app.auth.core import fastapi_users
 from app.models.user import UserTable
 from app.core.config import settings
 from app.services.analysis_service import run_full_analysis
+from app.services.image_utils import thumbnail_path_for
 from app.auth.db import get_async_session
 from app.models.analysis import Analysis
 from app.models.batch import UploadBatch
@@ -226,6 +227,14 @@ async def get_analysis_history(
             _preview_path_for(record.original_file_path), static_url_prefix
         )
         annotated_url = _existing_static_url(record.annotated_image_path, static_url_prefix)
+        thumbnail_source = (
+            record.annotated_image_path
+            or _preview_path_for(record.original_file_path)
+            or record.original_file_path
+        )
+        thumbnail_url = _existing_static_url(
+            thumbnail_path_for(thumbnail_source), static_url_prefix
+        )
         json_url = _existing_static_url(record.result_json_path, static_url_prefix)
         files_missing = bool(
             (record.original_file_path and not original_url)
@@ -246,6 +255,7 @@ async def get_analysis_history(
             "originalImageUrl": original_url,
             "originalPreviewUrl": original_preview_url,
             "annotatedImageUrl": annotated_url,
+            "thumbnailUrl": thumbnail_url,
             "resultJsonUrl": json_url,
             "filesMissing": files_missing,
         })
@@ -569,6 +579,7 @@ async def delete_analysis(
         files_to_delete = [
             analysis.original_file_path,
             analysis.annotated_image_path,
+            thumbnail_path_for(analysis.annotated_image_path),
             analysis.result_json_path
         ]
 
@@ -638,6 +649,7 @@ async def delete_analyses_batch(
                 files_to_delete = [
                     analysis.original_file_path,
                     analysis.annotated_image_path,
+                    thumbnail_path_for(analysis.annotated_image_path),
                     analysis.result_json_path
                 ]
                 for file_path in files_to_delete:

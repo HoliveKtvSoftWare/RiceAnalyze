@@ -42,6 +42,20 @@ class BatchJsonExportRequest(BaseModel):
     analysisIds: Optional[List[str]] = None
 
 
+class DataPackageItem(BaseModel):
+    """一条被勾选的数据项：同一条记录会拆成 image / json 两项。"""
+
+    analysisId: str
+    kind: str
+
+
+class DataPackageExportRequest(BaseModel):
+    """数据中心「下载选中」请求体：只打包用户勾选的图片或 JSON。"""
+
+    items: Optional[List[DataPackageItem]] = None
+    group: Optional[str] = None
+
+
 # ==================== 辅助服务函数 ====================
 
 def build_content_disposition(filename):
@@ -136,6 +150,100 @@ def _format_size(size_bytes):
         return "{:.1f} KB".format(size_bytes / 1024)
     else:
         return "{:.1f} MB".format(size_bytes / (1024 * 1024))
+
+
+_INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+
+def _safe_sample_name(original_file_path: Optional[str]) -> str:
+    """从原图路径得到安全的样本名，作为 ZIP 内的文件夹名。"""
+    raw = _extract_real_name(original_file_path) if original_file_path else "sample"
+    cleaned = _INVALID_FILENAME_CHARS.sub("_", raw).strip(" .")
+    return (cleaned or "sample")[:80]
+
+
+def _unique_folder_name(base_name: str, used_names: set) -> str:
+    """同一批下载里样本名可能重复（不同目录下的同名图片），加序号避免覆盖。"""
+    candidate = base_name
+    index = 1
+    while candidate.lower() in used_names:
+        index += 1
+        candidate = "{} ({})".format(base_name, index)
+    used_names.add(candidate.lower())
+    return candidate
+
+
+def _build_data_package_zip(selection) -> tuple:
+    """
+    只把用户勾选的数据项打包：图片与 JSON 分开处理，不再自动成对加入。
+
+    selection 是 [{'analysis': Analysis, 'kind': 'image'|'json'}, ...]。
+    图片优先取带掩膜的标注图，缺失时才用原图。
+    同一条记录的图片和 JSON 如果都被勾选，会落在同一个样本文件夹里；
+    只勾 JSON 时，压缩包中就只有该 JSON。
+
+    返回 (zip 临时文件路径, 打包成功的文件数)。同步函数，由线程池调用。
+    """
+    fd, temp_path = tempfile.mkstemp(suffix=".zip", prefix="rice_data_")
+    os.close(fd)
+
+    used_names = set()
+    folder_names = {}
+    entries = []
+
+    try:
+        for entry in selection:
+            analysis = entry['analysis']
+            kind = entry['kind']
+            analysis_key = str(analysis.analysis_id)
+
+            # 文件夹名按记录只生成一次：图片和 JSON 同时勾选时共用同一个目录
+            if analysis_key not in folder_names:
+                base_name = _safe_sample_name(
+                    analysis.original_file_path or analysis.annotated_image_path
+                )
+                folder_names[analysis_key] = {
+                    'base': base_name,
+                    'folder': _unique_folder_name(base_name, used_names),
+                }
+            names = folder_names[analysis_key]
+            base_name = names['base']
+            folder_name = names['folder']
+
+            if kind == 'json':
+                json_path = analysis.result_json_path
+                if json_path and os.path.exists(json_path):
+                    entries.append((json_path, "{}/{}.json".format(folder_name, base_name)))
+                continue
+
+            if kind == 'image':
+                # 数据中心展示 / 下载的都是带掩膜的分割图，旧记录缺失时才退回原图。
+                image_path = analysis.annotated_image_path
+                if not image_path or not os.path.exists(image_path):
+                    image_path = analysis.original_file_path
+                if not image_path or not os.path.exists(image_path):
+                    continue
+                image_ext = (os.path.splitext(image_path)[1] or ".jpg").lower()
+                entries.append(
+                    (image_path, "{}/{}{}".format(folder_name, base_name, image_ext))
+                )
+
+        written = set()
+        packed = 0
+        with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zipf:
+            for file_path, entry_name in entries:
+                if entry_name in written:
+                    continue
+                zipf.write(file_path, entry_name)
+                written.add(entry_name)
+                packed += 1
+        return temp_path, packed
+    except Exception:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise
 
 
 # ==================== API 端点 ====================
@@ -376,3 +484,93 @@ async def export_batch_json(
             status_code=500,
             detail="批量导出失败: {}".format(str(e))
         )
+
+
+@router.post("/packages")
+async def export_data_packages(
+    request_data: DataPackageExportRequest = Body(...),
+    user=Depends(fastapi_users.current_user(active=True)),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """
+    数据中心「下载选中」：只打包用户勾选的图片或 JSON，不再自动成对加入。
+
+    ZIP 结构示例（只勾 JSON 时就不会出现图片）：
+        {样本名}/
+            {样本名}{图片扩展名}  # 勾选了「图片」时（带掩膜的分割图）
+            {样本名}.json         # 勾选了「JSON」时
+    """
+    request_items = request_data.items or []
+    if not request_items:
+        raise HTTPException(status_code=422, detail="请传入要下载的数据项列表")
+
+    analysis_ids = list({item.analysisId for item in request_items})
+
+    try:
+        log.info(
+            "用户 {} 请求打包下载 {} 个数据项（{} 条记录）".format(
+                user.id, len(request_items), len(analysis_ids)
+            )
+        )
+
+        statement = (
+            select(Analysis)
+            .where(
+                Analysis.analysis_id.in_(analysis_ids),
+                Analysis.user_id == user.id,
+                Analysis.status == "completed",
+            )
+            .order_by(desc(Analysis.created_at))
+        )
+        result = await session.execute(statement)
+        analyses = result.scalars().all()
+
+        if not analyses:
+            raise HTTPException(status_code=404, detail="未找到可下载的已完成数据")
+
+        analysis_map = {str(analysis.analysis_id): analysis for analysis in analyses}
+        selection = []
+        for item in request_items:
+            kind = (item.kind or "").strip().lower()
+            if kind not in ("image", "json"):
+                continue
+            analysis = analysis_map.get(str(item.analysisId))
+            if not analysis:
+                continue
+            selection.append({"analysis": analysis, "kind": kind})
+
+        if not selection:
+            raise HTTPException(status_code=404, detail="选中的数据项没有可下载的文件")
+
+        zip_path, packed = await run_in_threadpool(_build_data_package_zip, selection)
+        if packed == 0:
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+            raise HTTPException(
+                status_code=404,
+                detail="选中的数据没有找到对应文件，无法打包下载",
+            )
+
+        label = {"leaf": "剑叶", "stem": "茎秆"}.get(
+            (request_data.group or "").strip().lower(), "分析"
+        )
+        now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        zip_filename = "{}数据_{}项_{}.zip".format(label, packed, now_str)
+
+        from starlette.background import BackgroundTask
+
+        log.info("数据打包完成: {} ({} 个文件)".format(zip_path, packed))
+        return FileResponse(
+            zip_path,
+            media_type="application/zip",
+            headers={"Content-Disposition": build_content_disposition(zip_filename)},
+            background=BackgroundTask(lambda: os.path.exists(zip_path) and os.remove(zip_path)),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("打包下载失败: {}".format(e), exc_info=True)
+        raise HTTPException(status_code=500, detail="打包下载失败: {}".format(str(e)))

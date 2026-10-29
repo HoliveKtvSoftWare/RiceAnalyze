@@ -98,6 +98,15 @@ Optional[str] = None, batch_id: Optional[str] = None, task_type: str = "stem"):
         )
         log.info(f"YOLO 推理完成。JSON 已保存至: {json_output_path}")
 
+        # 记录条只加载缩略图，避免下拉历史记录时一次请求多张 MB 级标注图。
+        # 生成失败不影响分析结果。
+        try:
+            from app.services.image_utils import ensure_thumbnail
+
+            ensure_thumbnail(annotated_image_path)
+        except Exception as thumb_error:
+            log.warning(f"生成标注图缩略图失败（忽略）: {thumb_error}")
+
         # 步骤 4: 更新数据库（含 model_used）
         log.info(f"开始更新数据库状态为 'completed'...")
         with Session(sync_engine) as session:
