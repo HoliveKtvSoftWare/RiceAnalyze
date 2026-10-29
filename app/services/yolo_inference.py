@@ -22,7 +22,7 @@ from PIL import Image, ImageDraw
 # 项目根目录里还留着一份旧版 ultralytics（8.2.57）副本，运行时会被优先导入，
 # 导致依赖新模块（如 YOLO11 的 C3k2）的权重加载失败：
 #     AttributeError: Can't get attribute 'C3k2' ...
-# requirements 固定的是 ultralytics==8.3.27，因此这里临时把 site-packages
+# requirements.txt.txt 固定的是 ultralytics==8.3.27，因此这里临时把 site-packages
 # 挪到 sys.path 最前面完成导入，随后恢复原顺序（子模块走包的 __path__，不受影响）。
 _SITE_PACKAGES = sysconfig.get_paths().get("purelib")
 _ORIGINAL_SYS_PATH = None
@@ -45,7 +45,7 @@ finally:
 import torch
 
 # 剑叶 OUR 头适配：必须在上面把 site-packages 的 ultralytics 提到 sys.path 首部之后再导入
-from app.services.our_head import OurSegmentationPredictor, adapt_our_model
+from app.services.leaf_head_adapter import OurSegmentationPredictor, adapt_our_model
 
 try:  # orjson 速度约为标准库的 3~10 倍，缺失时自动回退
     import orjson  # type: ignore

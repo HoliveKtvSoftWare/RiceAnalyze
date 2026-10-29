@@ -13,7 +13,7 @@
 from typing import Any, Dict
 
 from app.services import leaf_analysis
-from app.services.excel_download import ExcelDownloadService
+from app.services.stem_excel import ExcelDownloadService
 
 
 class LeafExcelService(ExcelDownloadService):

@@ -19,7 +19,7 @@ from app.auth.core import fastapi_users
 from app.models.user import UserTable
 from app.auth.db import get_async_session
 from app.models.analysis import Analysis
-from app.services.excel_download import excel_service
+from app.services.stem_excel import excel_service
 from app.services.leaf_excel import leaf_excel_service
 
 EXCEL_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -478,7 +478,7 @@ def _run_export_worker(
 
         now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{label}_{len(valid_data)}个文件_{now_str}_{unit}.xlsx"
-        file_path = service.export_all_to_excel(valid_data, selected_columns, filename)
+        file_path = service.export_all_to_excel(valid_data, selected_columns, filename, unit)
 
         with _export_tasks_lock:
             if task_id in _export_tasks:
@@ -517,7 +517,7 @@ def _build_single_export(analysis: Analysis, unit: str, scale: float, selected_c
     label = "剑叶" if _group_key(group) == "leaf" else "茎秆"
 
     analysis_data = service.load_analysis_data_from_record(analysis, unit, scale)
-    df = service.generate_excel_data(analysis_data, selected_columns)
+    df = service.generate_excel_data(analysis_data, selected_columns, unit)
 
     real_name = _extract_real_name(analysis.original_file_path)
     now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -546,6 +546,6 @@ def _do_export(records: list, selected_columns: List[str], unit: str, scale: flo
 
     now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{label}_{len(valid_data)}个文件_{now_str}_{unit}.xlsx"
-    file_path = service.export_all_to_excel(valid_data, selected_columns, filename)
+    file_path = service.export_all_to_excel(valid_data, selected_columns, filename, unit)
     log.info(f"Excel 导出完成: {file_path}（成功 {len(valid_data)}/{len(records)}）")
     return file_path, filename

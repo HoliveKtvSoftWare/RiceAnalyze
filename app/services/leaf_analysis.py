@@ -48,7 +48,8 @@ LEAF_BUNDLE_LABELS = (
 # 导出列定义。key 必须与 compute_leaf_metrics 的返回值一致。
 LEAF_COLUMNS: Dict[str, str] = {
     "filename": "样本名称",
-    "scaleUmPerPx": "比例尺(µm/px)",
+    # 比例尺按当前导出单位换算，列名在导出时动态生成（比例尺(mm/px) 等）
+    "scalePerPx": "比例尺",
     "sectionArea": "截面面积(含腔)",
     "tissueArea": "组织净面积",
     "body1Area": "主脉面积",
@@ -329,7 +330,9 @@ def compute_leaf_metrics(analysis_data: Dict[str, Any], unit: str, k: float) -> 
     )
 
     return {
-        "scaleUmPerPx": round(k, 4),
+        # scaleUmPerPx 恒为 µm/px（前端做稳定换算用）；scalePerPx 按当前单位换算
+        "scaleUmPerPx": round(k, 6),
+        "scalePerPx": round(length_factor, 6),
         # 0~1，值越大说明区域标签冲突越严重（理想接近 0）
         "regionOverlapRatio": round(overlap_ratio, 4),
         # 空腔完全位于主脉内部，截面面积不重复计入
@@ -434,7 +437,7 @@ def compute_from_paths(original_file_path: str, json_file_path: str, unit: str =
         k = float(scale) if scale and scale > 0 else 1.0
         log.warning("[leaf] 未识别到图内比例尺，回退 scale=%.4f µm/px", k)
 
-    from app.services.excel_download import _normalize_sample_name
+    from app.services.stem_excel import _normalize_sample_name
 
     row: Dict[str, Any] = {
         "filename": _normalize_sample_name(

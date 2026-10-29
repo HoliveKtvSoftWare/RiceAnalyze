@@ -202,7 +202,7 @@ class BaseDataset(Dataset):
             np.save(f.as_posix(), cv2.imread(self.im_files[i]), allow_pickle=False)
 
     def check_cache_ram(self, safety_margin=0.5):
-        """Check image caching requirements vs available memory."""
+        """Check image caching requirements.txt vs available memory."""
         b, gb = 0, 1 << 30  # bytes of cached images, bytes per gigabytes
         n = min(self.ni, 30)  # extrapolate from 30 random images
         for _ in range(n):

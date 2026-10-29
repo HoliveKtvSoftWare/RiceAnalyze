@@ -46,16 +46,16 @@ from ultralytics.utils import (
 )
 
 
-def parse_requirements(file_path=ROOT.parent / "requirements.txt", package=""):
+def parse_requirements(file_path=ROOT.parent / "requirements.txt.txt", package=""):
     """
-    Parse a requirements.txt file, ignoring lines that start with '#' and any text after '#'.
+    Parse a requirements.txt.txt file, ignoring lines that start with '#' and any text after '#'.
 
     Args:
-        file_path (Path): Path to the requirements.txt file.
-        package (str, optional): Python package to use instead of requirements.txt file, i.e. package='ultralytics'.
+        file_path (Path): Path to the requirements.txt.txt file.
+        package (str, optional): Python package to use instead of requirements.txt.txt file, i.e. package='ultralytics'.
 
     Returns:
-        (List[Dict[str, str]]): List of parsed requirements as dictionaries with `name` and `specifier` keys.
+        (List[Dict[str, str]]): List of parsed requirements.txt as dictionaries with `name` and `specifier` keys.
 
     Example:
         ```python
@@ -246,7 +246,7 @@ def check_version(
     if not result:
         warning = f"WARNING ⚠️ {name}{op}{version} is required, but {name}=={current} is currently installed {msg}"
         if hard:
-            raise ModuleNotFoundError(emojis(warning))  # assert version requirements met
+            raise ModuleNotFoundError(emojis(warning))  # assert version requirements.txt.txt met
         if verbose:
             LOGGER.warning(warning)
     return result
@@ -336,23 +336,23 @@ def check_python(minimum: str = "3.8.0", hard: bool = True) -> bool:
 
 
 @TryExcept()
-def check_requirements(requirements=ROOT.parent / "requirements.txt", exclude=(), install=True, cmds=""):
+def check_requirements(requirements=ROOT.parent / "requirements.txt.txt", exclude=(), install=True, cmds=""):
     """
-    Check if installed dependencies meet YOLOv8 requirements and attempt to auto-update if needed.
+    Check if installed dependencies meet YOLOv8 requirements.txt and attempt to auto-update if needed.
 
     Args:
-        requirements (Union[Path, str, List[str]]): Path to a requirements.txt file, a single package requirement as a
-            string, or a list of package requirements as strings.
+        requirements (Union[Path, str, List[str]]): Path to a requirements.txt.txt file, a single package requirement as a
+            string, or a list of package requirements.txt as strings.
         exclude (Tuple[str]): Tuple of package names to exclude from checking.
-        install (bool): If True, attempt to auto-update packages that don't meet requirements.
+        install (bool): If True, attempt to auto-update packages that don't meet requirements.txt.
         cmds (str): Additional commands to pass to the pip install command when auto-updating.
 
     Example:
         ```python
         from ultralytics.utils.checks import check_requirements
 
-        # Check a requirements.txt file
-        check_requirements('path/to/requirements.txt')
+        # Check a requirements.txt.txt file
+        check_requirements('path/to/requirements.txt.txt')
 
         # Check a single package
         check_requirements('ultralytics>=8.0.0')
@@ -362,10 +362,10 @@ def check_requirements(requirements=ROOT.parent / "requirements.txt", exclude=()
         ```
     """
 
-    prefix = colorstr("red", "bold", "requirements:")
+    prefix = colorstr("red", "bold", "requirements.txt:")
     check_python()  # check python version
     check_torchvision()  # check torch-torchvision compatibility
-    if isinstance(requirements, Path):  # requirements.txt file
+    if isinstance(requirements, Path):  # requirements.txt.txt file
         file = requirements.resolve()
         assert file.exists(), f"{prefix} {file} not found, check failed."
         requirements = [f"{x.name}{x.specifier}" for x in parse_requirements(file) if x.name not in exclude]
@@ -378,7 +378,7 @@ def check_requirements(requirements=ROOT.parent / "requirements.txt", exclude=()
         match = re.match(r"([a-zA-Z0-9-_]+)([<>!=~]+.*)?", r_stripped)
         name, required = match[1], match[2].strip() if match[2] else ""
         try:
-            assert check_version(metadata.version(name), required)  # exception if requirements not met
+            assert check_version(metadata.version(name), required)  # exception if requirements.txt.txt not met
         except (AssertionError, metadata.PackageNotFoundError):
             pkgs.append(r)
 

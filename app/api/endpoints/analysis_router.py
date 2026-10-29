@@ -506,7 +506,7 @@ async def get_analysis_metrics(
     剑叶页面的“指标卡片”用它渲染：面积、周长、各类维管束计数等。
     几何计算 + 比例尺识别需要解码原图，因此放到线程池执行。
     """
-    from app.services.excel_download import excel_service
+    from app.services.stem_excel import excel_service
     from app.services.leaf_excel import leaf_excel_service
 
     statement = select(Analysis).where(

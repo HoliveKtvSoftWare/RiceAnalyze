@@ -19,13 +19,13 @@ from app.auth.schemas import UserCreate, UserRead, UserUpdate
 from fastapi.staticfiles import StaticFiles
 from app.core.config import settings
 from app.api.endpoints import analysis_router as analysis_router
-from app.api.endpoints import excel_router as excel_router
-from app.api.endpoints import export_router
+from app.api.endpoints import export_excel_router as excel_router
+from app.api.endpoints import export_json_router
 from app.auth.core import fastapi_users
 
 log = logging.getLogger(__name__)
 
-# 有 orjson 时用更快的 JSON 序列化器（requirements 已包含），缺失时自动回退
+# 有 orjson 时用更快的 JSON 序列化器（requirements.txt.txt 已包含），缺失时自动回退
 try:
     import orjson  # noqa: F401
 

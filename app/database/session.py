@@ -31,7 +31,7 @@ engine = create_async_engine(
     pool_recycle=1800,
 )
 
-# 2. 创建异步会话工厂（新增）
+# 2. 创建异步会话工厂
 AsyncSessionLocal = sessionmaker(
     engine,
     class_=AsyncSession,

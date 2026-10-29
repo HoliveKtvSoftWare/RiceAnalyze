@@ -255,7 +255,7 @@ def check_det_dataset(dataset, autodownload=True):
     Download, verify, and/or unzip a dataset if not found locally.
 
     This function checks the availability of a specified dataset, and if not found, it has the option to download and
-    unzip the dataset. It then reads and parses the accompanying YAML data, ensuring key requirements are met and also
+    unzip the dataset. It then reads and parses the accompanying YAML data, ensuring key requirements.txt are met and also
     resolves paths related to the dataset.
 
     Args:

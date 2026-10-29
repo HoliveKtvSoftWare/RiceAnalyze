@@ -13,7 +13,7 @@ log = logging.getLogger(__name__)
 @lru_cache(maxsize=8)
 def _parse_models(raw: str, default_path: str) -> tuple:
     """
-    解析 YOLO_MODELS 配置（结果按原始字符串缓存）。
+    解析 YOLO_MODELS 配置。
 
     /api/analysis/models 与每次上传都会调用该配置，
     之前每次都要重新 json.loads 并构造新结构，属于不必要的重复开销。
