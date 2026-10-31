@@ -21,13 +21,14 @@ from app.auth.db import get_async_session
 from app.models.analysis import Analysis
 from app.services.stem_excel import excel_service
 from app.services.leaf_excel import leaf_excel_service
+from app.core.task_groups import task_group, group_condition
 
 EXCEL_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
 def _group_key(group: Optional[str]) -> str:
     """规范化分析大类：leaf=剑叶，其余一律按 stem（茎秆）处理。"""
-    return "leaf" if (group or "").strip().lower() == "leaf" else "stem"
+    return task_group(group)
 
 
 def _service_for(group: Optional[str]):
@@ -119,7 +120,7 @@ async def export_all_analysis_to_excel(
         statement = select(Analysis).where(
             Analysis.user_id == user.id,
             Analysis.status == "completed",
-            Analysis.task_type == group
+            group_condition(Analysis.task_type, group)
         ).order_by(Analysis.created_at.desc())
 
         result = await db.execute(statement)
@@ -182,14 +183,14 @@ async def export_batch_to_excel(
             statement = select(Analysis).where(
                 Analysis.user_id == user.id,
                 Analysis.status == "completed",
-                Analysis.task_type == group
+                group_condition(Analysis.task_type, group)
             ).order_by(Analysis.created_at.desc())
         elif request_data.analysisIds:
             statement = select(Analysis).where(
                 Analysis.analysis_id.in_(request_data.analysisIds),
                 Analysis.user_id == user.id,
                 Analysis.status == "completed",
-                Analysis.task_type == group
+                group_condition(Analysis.task_type, group)
             )
         else:
             raise HTTPException(status_code=400, detail="请传入 analysisIds 或设置 allCompleted=true")

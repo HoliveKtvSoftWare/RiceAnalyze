@@ -1,20 +1,34 @@
-# 推送时忽略模型文件
-/models_yolo/
-
-# 推送时忽略个人数据
-/app_storage/
-
-# 推送时忽略日志文件
-/logs/
-
-# 推送时忽略缓存文件
-/.cache/
-
-# 推送时忽略其他临时文件
-__pycache__/
-
-# 推送时忽略环境变量文件
+# 本地配置与数据库凭据（.env.example 配置模板正常提交）
 .env
 
-# 推送时忽略 ultralytics 库文件
-ultralytics/
+# 模型权重与用户运行数据
+/models_yolo/
+/app_storage/
+
+# Python 虚拟环境与缓存
+/.venv/
+/.venv-fork/
+__pycache__/
+*.py[cod]
+
+# 历史定制环境、本地依赖与旧数据库目录
+/.ultra_refine/
+/.pylibs/
+/ultralytics/
+/.legacy_pgsql_data/
+
+# 推理缓存、日志与临时输出
+/.ultralytics/
+/.cache/
+/.piptmp/
+/logs/
+/.run/
+/_seg_out/
+/tests/**/.tmp/
+
+# 离线导出任务与本地实施记录
+/rice_export_tasks/
+/docs/superpowers/
+
+# IDE 个人配置
+.idea/

@@ -25,6 +25,7 @@ from fastapi import HTTPException
 from sqlmodel import create_engine
 from openpyxl.utils import get_column_letter
 from app.core.config import settings
+from app.core.paths import backend_path
 from app.models.analysis import Analysis
 
 log = logging.getLogger(__name__)
@@ -376,8 +377,8 @@ class ExcelDownloadService:
         :return: 完整的分析指标字典。
         :raises HTTPException 404: 当原始文件或 JSON 文件路径无效或文件不存在时。
         """
-        original_file_path = record.original_file_path
-        json_file_path = record.result_json_path
+        original_file_path = backend_path(record.original_file_path) if record.original_file_path else None
+        json_file_path = backend_path(record.result_json_path) if record.result_json_path else None
 
         if not original_file_path or not os.path.exists(original_file_path):
             raise HTTPException(status_code=404, detail=f"原始文件不存在: {original_file_path}")

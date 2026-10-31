@@ -82,7 +82,7 @@ async def lifespan(app: FastAPI):
     try:
         from app.services.yolo_inference import preload_models
 
-        preload_models(list(settings.get_models_map().values()))
+        preload_models(list(settings.get_models_map().values()) + list(settings.get_leaf_models_map().values()))
     except Exception as preload_error:  # pragma: no cover - 预热失败不影响服务
         log.warning(f"模型预热启动失败（忽略）: {preload_error}")
 

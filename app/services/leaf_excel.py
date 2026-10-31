@@ -2,7 +2,7 @@
 
 复用茎秆导出的落盘 / 列宽 / 文件命名逻辑，只替换两处：
 
-1. 可导出列 —— 剑叶的 34 列（见 ``leaf_analysis.LEAF_COLUMNS``）；
+1. 可导出列 —— 包含实际侧脉长度，暂不提供排列顺序（见 ``leaf_analysis.LEAF_COLUMNS``）；
 2. 指标口径 —— ``leaf_analysis.compute_from_paths``（主脉/侧脉/空腔 + 7 类维管束）。
 
 因此 ``load_analysis_data_from_record``、``generate_excel_data``、

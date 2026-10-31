@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 # 这个引擎是 SQLAlchemy 与数据库沟通的核心接口
 engine = create_async_engine(
     settings.DATABASE_URL,
-    echo=False,
+    echo=settings.DB_ECHO,
     future=True,
     pool_size=10,
     max_overflow=20,
@@ -50,6 +50,7 @@ AsyncSessionLocal = sessionmaker(
 # 并把历史记录统一标成 stem（加列时带 DEFAULT，老行会被自动填充）。
 _SCHEMA_DDL = (
     "ALTER TABLE analyses ADD COLUMN IF NOT EXISTS task_type VARCHAR DEFAULT 'stem'",
+    "ALTER TABLE upload_batches ADD COLUMN IF NOT EXISTS batch_name VARCHAR",
     "UPDATE analyses SET task_type = 'stem' WHERE task_type IS NULL",
     "CREATE INDEX IF NOT EXISTS ix_analyses_task_type ON analyses (task_type)",
     "CREATE INDEX IF NOT EXISTS ix_analyses_user_created_at ON analyses (user_id, created_at DESC)",
@@ -63,7 +64,10 @@ async def _ensure_schema_upgrades(conn):
         return
     for ddl in _SCHEMA_DDL:
         try:
-            await conn.execute(text(ddl))
+            # PostgreSQL aborts the transaction after a failed statement.
+            # Isolate optional upgrades so subsequent ones can still execute.
+            async with conn.begin_nested():
+                await conn.execute(text(ddl))
         except Exception as error:  # pragma: no cover - 升级失败不应阻断启动
             log.warning(f"数据库结构升级失败（忽略）: {ddl} -> {error}")
 

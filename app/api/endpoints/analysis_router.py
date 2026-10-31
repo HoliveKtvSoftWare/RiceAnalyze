@@ -14,6 +14,8 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from app.auth.core import fastapi_users
 from app.models.user import UserTable
 from app.core.config import settings
+from app.core.paths import backend_path
+from app.core.task_groups import task_group, group_condition
 from app.services.analysis_service import run_full_analysis
 from app.services.image_utils import thumbnail_path_for
 from app.auth.db import get_async_session
@@ -87,6 +89,11 @@ def _path_to_static_url(path: Optional[str], static_url_prefix: str) -> Optional
         return None
 
     try:
+        # Resolve historical relative paths against the same root as settings.
+        resolved = backend_path(path)
+        if os.path.commonpath([resolved, settings.STORAGE_PATH]) == settings.STORAGE_PATH:
+            relative = os.path.relpath(resolved, settings.STORAGE_PATH).replace('\\', '/')
+            return f"{static_url_prefix}{quote(relative, safe='/')}"
         cleaned = path.replace('\\', '/')
         while '//' in cleaned:
             cleaned = cleaned.replace('//', '/')
@@ -121,7 +128,7 @@ def _existing_static_url(path: Optional[str], static_url_prefix: str) -> Optiona
     如果照常返回 URL，前端只会拿到一个 404，显示成"无法加载图片"，既误导用户也难排查。
     这里直接返回 None，前端就能明确提示"文件已丢失"。
     """
-    if not path or not os.path.exists(path):
+    if not path or not os.path.exists(backend_path(path)):
         return None
     return _path_to_static_url(path, static_url_prefix)
 
@@ -187,9 +194,9 @@ async def get_analysis_history(
 
     conditions = [Analysis.user_id == user.id]
     if group_key == "leaf":
-        conditions.append(Analysis.task_type == "leaf")
+        conditions.append(group_condition(Analysis.task_type, "leaf"))
     elif group_key == "stem":
-        conditions.append(or_(Analysis.task_type == "stem", Analysis.task_type.is_(None)))
+        conditions.append(group_condition(Analysis.task_type, "stem"))
 
     statement = select(Analysis).where(*conditions).order_by(Analysis.created_at.desc())
     if limit is not None:
@@ -248,7 +255,7 @@ async def get_analysis_history(
             "batchIndex": record.batch_index,
             "createdAt": record.created_at,
             "status": record.status,
-            "taskType": record.task_type or "stem",
+            "taskType": task_group(record.task_type),
             "modelUsed": record.model_used,
             "errorMessage": record.error_message,
             "originalFilename": original_filename,
@@ -409,6 +416,8 @@ async def upload_adaptive(
         f"({'单文件模式' if is_single else '批量模式'})"
     )
 
+    if task_type == "stem":
+        model_name = "yolov8s"
     _validate_model(model_name, task_type)
 
     batch_name = _extract_folder_name(files)
@@ -507,7 +516,7 @@ async def upload_images_batch(
 async def get_analysis_metrics(
     analysis_id: str,
     unit: str = Query("μm", description="长度单位：µm / mm / cm"),
-    scale: float = Query(500.0, gt=0, description="未识别到图内比例尺时的回退像素当量（µm/px）"),
+    scale: float = Query(500.0, gt=0, description="图中比例尺代表的物理长度（µm）"),
     user: UserTable = Depends(current_active_user),
     db: AsyncSession = Depends(get_async_session),
 ) -> Dict[str, Any]:
@@ -531,7 +540,7 @@ async def get_analysis_metrics(
     if analysis.status != "completed":
         raise HTTPException(status_code=400, detail=f"记录尚未完成（当前状态: {analysis.status}）")
 
-    task_type = (analysis.task_type or "stem").strip().lower()
+    task_type = task_group(analysis.task_type)
     service = leaf_excel_service if task_type == "leaf" else excel_service
 
     try:

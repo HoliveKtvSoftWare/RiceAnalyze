@@ -12,39 +12,18 @@ import os
 import json
 import base64
 import logging
-import sys
-import sysconfig
+from functools import wraps
 import threading
 
 import numpy as np
 from PIL import Image, ImageDraw
 
-# 项目根目录里还留着一份旧版 ultralytics（8.2.57）副本，运行时会被优先导入，
-# 导致依赖新模块（如 YOLO11 的 C3k2）的权重加载失败：
-#     AttributeError: Can't get attribute 'C3k2' ...
-# requirements.txt.txt 固定的是 ultralytics==8.3.27，因此这里临时把 site-packages
-# 挪到 sys.path 最前面完成导入，随后恢复原顺序（子模块走包的 __path__，不受影响）。
-_SITE_PACKAGES = sysconfig.get_paths().get("purelib")
-_ORIGINAL_SYS_PATH = None
-if _SITE_PACKAGES:
-    _normalized_site_packages = os.path.abspath(_SITE_PACKAGES)
-    _rest = [
-        entry for entry in sys.path
-        if os.path.abspath(entry or os.getcwd()) != _normalized_site_packages
-    ]
-    if _rest != sys.path:
-        _ORIGINAL_SYS_PATH = list(sys.path)
-        sys.path = [_SITE_PACKAGES] + _rest
-try:
-    import ultralytics  # noqa: F401
-    from ultralytics import YOLO
-finally:
-    if _ORIGINAL_SYS_PATH is not None:
-        sys.path[:] = _ORIGINAL_SYS_PATH
+import ultralytics
+from ultralytics import YOLO
 
 import torch
 
-# 剑叶 OUR 头适配：必须在上面把 site-packages 的 ultralytics 提到 sys.path 首部之后再导入
+# OUR refinement is attached only to this model instance, using official Ultralytics.
 from app.services.leaf_head_adapter import OurSegmentationPredictor, adapt_our_model
 
 try:  # orjson 速度约为标准库的 3~10 倍，缺失时自动回退
@@ -61,6 +40,16 @@ log.info("ultralytics %s (%s)", getattr(ultralytics, "__version__", "unknown"),
 _MODEL_CACHE: dict = {}
 _MODEL_CACHE_LOCK = threading.RLock()
 _DEVICE = None
+_INFERENCE_LOCK = threading.RLock()
+
+
+def _serialized(function):
+    """YOLO predictors and OpenCV graph-cut RNG are process-shared resources."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with _INFERENCE_LOCK:
+            return function(*args, **kwargs)
+    return wrapped
 
 
 def _get_device():
@@ -71,6 +60,7 @@ def _get_device():
     return _DEVICE
 
 
+@_serialized
 def get_model(model_path, device=None, warmup=True):
     """
     获取（并缓存）已加载到指定设备的 YOLO 模型。
@@ -606,10 +596,12 @@ def draw_polygons_on_image(image, shapes, colors=None):
     return image.convert("RGB")
 
 
+@_serialized
 def run_system(model_path, image_path, output_path, output_basename,
                smooth=True, smooth_method='chaikin', smooth_iterations=2, colors=None,
                conf=None, iou=None, retina_masks=False,
-               filter_small_components=False, min_mask_area_px=0):
+               filter_small_components=False, min_mask_area_px=0,
+               require_refinement=False, side_postprocess=None):
     """
     完整 YOLO 推理流程：加载模型、执行推理、生成 LabelMe JSON 标注文件和带掩膜的可视化图片。
 
@@ -634,6 +626,20 @@ def run_system(model_path, image_path, output_path, output_basename,
     Raises:
         Exception: 推理过程中发生的任何异常
     """
+    if require_refinement:
+        from app.core.config import settings
+        from app.infrastructure.inference.runner import run_system as run_leaf
+        return run_leaf(
+            model_path, image_path, output_path, output_basename,
+            smooth=False, colors=colors, embed_image=True,
+            draw_first=("body1", "side1", "side2", "body2"),
+            outline_labels=("body1", "side1", "side2", "body2"),
+            imgsz=None, conf=0.25 if conf is None else conf,
+            iou=0.45 if iou is None else iou, retina_masks=True,
+            preserve_mask_topology=True, validate_side_bundles=True,
+            preview_smooth=False, require_refinement=True, model=get_model(model_path),
+            side_postprocess=settings.LEAF_POSTPROCESS if side_postprocess is None else side_postprocess,
+        )
     try:
         log.info(f"开始推理任务... 模型: {model_path}, 图片: {image_path}")
 

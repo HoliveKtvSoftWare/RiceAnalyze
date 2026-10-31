@@ -1,0 +1,1 @@
+"""Pure analysis-domain helpers."""

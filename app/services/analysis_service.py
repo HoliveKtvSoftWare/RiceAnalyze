@@ -11,6 +11,7 @@ from app.services.yolo_inference import run_system
 # 导入数据库相关的工具
 from sqlmodel import create_engine, Session, select
 from app.core.config import settings
+from app.core.task_groups import task_group
 from app.models.analysis import Analysis
 
 # 设置日志
@@ -43,9 +44,7 @@ Optional[str] = None, batch_id: Optional[str] = None, task_type: str = "stem"):
         task_type: 分析类型，``stem``（茎秆截面，默认）或 ``leaf``（剑叶）；
             决定用哪套模型注册表与渲染配色
     """
-    task_type = (task_type or "stem").strip().lower()
-    if task_type not in ("stem", "leaf"):
-        task_type = "stem"
+    task_type = task_group(task_type)
     try:
         log.info(
             f"--- [任务 {analysis_id}] 开始处理 (类型: {task_type}, "
@@ -71,10 +70,10 @@ Optional[str] = None, batch_id: Optional[str] = None, task_type: str = "stem"):
         # 步骤 3: 调用 YOLO 推理服务
         # 茎秆沿用原来的多边形平滑与四类配色；剑叶用 11 类自定义配色、不平滑
         # （平滑会改变周长口径，剑叶周长直接按多边形弦长求和）。
-        # 剑叶额外对齐 V2 的推理/后处理参数：
+        # 剑叶：拓扑轮廓、维管束归属核对，side用方案B，body用局部轮廓修正。
         #   retina_masks=True  -> 高分辨率掩膜，轮廓更细
         #   iou=0.45           -> NMS 更严，减少同一结构被重复检测
-        #   filter_small_components + min_mask_area_px=64 -> 去掉掩膜内噪点和微小的误检实例
+        #   独立维管束实例与坐标保留；不添加额外填孔步骤。
         log.info(f"开始执行 YOLO 推理... 图片: {original_file_path}")
         inference_kwargs = {}
         if task_type == "leaf":
@@ -86,8 +85,8 @@ Optional[str] = None, batch_id: Optional[str] = None, task_type: str = "stem"):
                 "conf": 0.25,
                 "iou": 0.45,
                 "retina_masks": True,
-                "filter_small_components": True,
-                "min_mask_area_px": 64,
+                "require_refinement": True,
+                "side_postprocess": settings.LEAF_POSTPROCESS,
             }
         annotated_image_path, json_output_path = run_system(
             model_path=model_path,
